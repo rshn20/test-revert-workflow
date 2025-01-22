@@ -1,0 +1,543 @@
+name: Leadgenie stack deployment
+
+on:
+  workflow_call:
+    inputs:
+      clusterName:
+        description: GKE cluster to deploy charts to
+        type: string
+        required: true
+      clusterLocation:
+        description: GKE cluster region/availability zone
+        type: string
+        default: us-central1-c
+      command:
+        description: helm command to execute
+        type: string
+        default: upgrade --install
+      deployFrontendApp:
+        description: whether to deploy the frontend app
+        type: boolean
+        default: true
+      deployBackend:
+        description: whether to deploy the backend
+        type: boolean
+        default: true
+      deployCron:
+        description: whether to deploy cronjobs
+        type: boolean
+        default: false
+      deployPrePostJobs:
+        description: whether to deploy pre and post deployment jobs
+        type: boolean
+        default: false
+      deploySidekiq:
+        description: whether to deploy sidekiq workers
+        type: boolean
+        default: false
+      deploySidekiqMetrics:
+        description: whether to deploy sidekiq metrics
+        type: boolean
+        default: true
+      environment:
+        description: staging or production
+        type: string
+        required: true
+      gitSha:
+        description: commit hash that is being deployed
+        type: string
+        required: true
+      namespace:
+        description: kubernetes namespace
+        type: string
+        required: true
+      notify:
+        description: whether or not to notify developers of successful deployment
+        type: boolean
+        default: false
+      preDeployMigrationFiles:
+        description: JSON string array of file names to be deployed before backend deployments
+        type: string
+        default: ''
+      postDeployMigrationFiles:
+        description: JSON string array of file names to be deployed after backend deployments
+        type: string
+        default: ''
+      secretsStoreCredentials:
+        description: name of credentials provider yml file to be used in deployment, one of staging | production. Defaults to name of the environment
+        type: string
+        default: ''
+      workloadIdentityProvider:
+        description: GCP workload identity federation provider
+        type: string
+        required: true
+      workloadIdentityServiceAccount:
+        description: service account with permission to deploy
+        type: string
+        required: true
+      gitBranchName:
+        description: sanitized git branch name
+        type: string
+        required: false
+        default: master
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  MIGRATIONS_GCS_BUCKET: 'gs://apollo-ops_gha_artifacts'
+  SLACK_CHANNEL: eng-infrastructure-alerts
+  SLACK_COLOR: '#ff0000'
+  SLACK_FOOTER: ''
+  SLACK_ICON_EMOJI: ':apollo-logo:'
+  SLACK_LINK_NAMES: true
+  SLACK_USERNAME: Apollo Action Bot
+  SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+
+jobs:
+  matrix:
+    runs-on:
+      - self-hosted
+      - ${{ inputs.environment == 'production' && 'critical' || 'general' }}
+      - low-resource
+    outputs:
+      matrix: ${{ steps.matrix.outputs.result }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.APOLLOIO_TOKEN }}
+
+      - uses: actions/github-script@v7
+        id: matrix
+        env:
+          environment: ${{ inputs.environment }}
+          deploySidekiq: ${{ inputs.deploySidekiq }}
+          deploySidekiqMetrics: ${{ inputs.deploySidekiqMetrics }}
+          deployCron: ${{ inputs.deployCron }}
+          namespace: ${{ inputs.namespace }}
+          deployBackend: ${{ inputs.deployBackend }}
+          deployFrontendApp: ${{ inputs.deployFrontendApp }}
+          deployPrePostJobs: ${{ inputs.deployPrePostJobs }}
+          preDeployMigrationFiles: ${{ inputs.preDeployMigrationFiles }}
+          postDeployMigrationFiles: ${{ inputs.postDeployMigrationFiles }}
+          secretsStoreCredentials: ${{ inputs.secretsStoreCredentials }}
+        with:
+          github-token: ${{ secrets.APOLLOIO_TOKEN }}
+          result-encoding: json
+          script: |
+            const script = require('.github/workflows/scripts/generate-deployment-matrix.js');
+            return script();
+
+  additional-resources:
+    runs-on:
+      - self-hosted
+      - ${{ inputs.environment == 'production' && 'critical' || 'general' }}
+      - low-resource
+    needs:
+      - matrix
+    outputs:
+      lastDeployedCommit: ${{ steps.last-deployed-commit.outputs.last_deployed_commit }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.APOLLOIO_TOKEN }}
+
+      - name: Prepare for deployment
+        uses: ./.github/actions/setup-k8s
+        with:
+          clusterName: ${{ inputs.clusterName }}
+          clusterLocation: ${{ inputs.clusterLocation }}
+          workloadIdentityProvider: ${{ inputs.workloadIdentityProvider }}
+          workloadIdentityServiceAccount: ${{ inputs.workloadIdentityServiceAccount }}
+
+      - name: Get last deployed commit
+        id: last-deployed-commit
+        if: ${{ inputs.notify }}
+        run: echo "last_deployed_commit=$(helm -n ${{ inputs.namespace }} get values rails-api --output json | jq -r '.image.tag')" >> $GITHUB_OUTPUT
+
+      - name: Deploy additional preview manifests
+        if: ${{ inputs.environment == 'staging' }}
+        run: |
+          pr_number=${{ github.event.number }}
+          sed -i "s/pr_number/${pr_number:=n-a}/" kubernetes/staging/pull-request-overrides/manifests/*.yaml
+          sed -i 's/{{namespace}}/${{ inputs.namespace }}/' kubernetes/staging/pull-request-overrides/manifests/*.yaml
+          kubectl -n ${{ inputs.namespace }} apply -f ./kubernetes/staging/pull-request-overrides/manifests
+          gcloud iam service-accounts add-iam-policy-binding staging-rails-access@stage-23704.iam.gserviceaccount.com \
+            --role roles/iam.workloadIdentityUser \
+            --member "serviceAccount:stage-23704.svc.id.goog[${{ inputs.namespace }}/staging-rails-sa]"
+
+  dependencies:
+    name: ${{ matrix.name }}
+    runs-on:
+      - self-hosted
+      - ${{ inputs.environment == 'production' && 'critical' || 'general' }}
+      - low-resource
+    needs:
+      - matrix
+      - additional-resources
+    strategy:
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix).dependencies }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.APOLLOIO_TOKEN }}
+
+      - name: Prepare for deployment
+        uses: ./.github/actions/setup-k8s
+        with:
+          clusterName: ${{ inputs.clusterName }}
+          clusterLocation: ${{ inputs.clusterLocation }}
+          workloadIdentityProvider: ${{ inputs.workloadIdentityProvider }}
+          workloadIdentityServiceAccount: ${{ inputs.workloadIdentityServiceAccount }}
+
+      - name: Deploy
+        run: |
+          helm ${{ inputs.command }} \
+            --namespace ${{ inputs.namespace }} \
+            -f ${{ join(matrix.values, ' -f ') }} \
+            --set-string gitSha=${{ inputs.gitSha }} \
+            --set-string gitBranchName=${{ inputs.gitBranchName }} \
+            --set image.tag=${{ inputs.gitSha }} \
+            --wait --timeout 15m \
+            --description "commit=${{ inputs.gitSha }}" \
+            --history-max 50 \
+            ${{ matrix.name }} ${{ matrix.chart }}
+
+      - name: Helm rollback if status is in pending-upgrade
+        if: ${{ inputs.environment == 'staging' && failure() }}
+        run: |
+          ./scripts/helm-rollback/helm-rollback.sh ${{ matrix.name }} ${{ inputs.namespace }}
+
+  pre-deploy:
+    name: 'Pre: ${{ matrix.name }}'
+    runs-on:
+      - self-hosted
+      - ${{ inputs.environment == 'production' && 'critical' || 'general' }}
+      - low-resource
+    needs:
+      - matrix
+      - dependencies
+    # only run if preDeploy matrix contains at least one item
+    if: ${{ fromJson(needs.matrix.outputs.matrix).preDeploy.include[0] != '' }}
+    strategy:
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix).preDeploy }}
+      fail-fast: false
+    env:
+      MIGRATIONS_FILE_PATH: 'db-migration-files/pre-deploy'
+      MIGRATIONS_LOG_PATH: 'db-migration-logs/pre-deploy'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.APOLLOIO_TOKEN }}
+          fetch-depth: 75
+
+      - name: Prepare for deployment
+        uses: ./.github/actions/setup-k8s
+        with:
+          clusterName: ${{ inputs.clusterName }}
+          clusterLocation: ${{ inputs.clusterLocation }}
+          workloadIdentityProvider: ${{ inputs.workloadIdentityProvider }}
+          workloadIdentityServiceAccount: ${{ inputs.workloadIdentityServiceAccount }}
+
+      - name: Deploy job
+        id: deploy
+        run: |
+          helm template ${{ matrix.name }} ${{ matrix.chart }} \
+            -f ${{ join(matrix.values, ' -f ') }} \
+            --set jobName=${{ matrix.name }} \
+            --set image.tag=${{ inputs.gitSha }} \
+            --set gitSha=${{ inputs.gitSha }} \
+            --set backoffLimit=0 \
+            --set railsCommand="${{ matrix.command }}" | \
+          kubectl apply -n ${{ inputs.namespace }} -f -
+          ./scripts/depenency-job-status-check/dependency_jobs_status.sh ${{ matrix.name }} ${{ inputs.namespace }} 30 24
+
+      - name: Slack Notification
+        if: ${{ always() && steps.deploy.outcome == 'failure' && inputs.environment == 'production' }}
+        uses: rtCamp/action-slack-notify@v2.3.1
+        env:
+          SLACK_MESSAGE: 'This <https://github.com/apolloio/leadgenie/actions/runs/${{ github.run_id }}|Pre-deploy migration> failed. @oncall-eng-devops please take a look.'
+
+      - name: Display and upload pod logs to gcs bucket
+        if: always() && steps.deploy.conclusion != 'skipped'
+        run: |
+            ./scripts/db-migrations/check_pod_logs.sh -j "${{ matrix.name }}" -f "${{ matrix.name }}" -l 10 -s 60 -n ${{ inputs.namespace }} -e ${{ inputs.environment }}
+
+  workers:
+    name: ${{ matrix.name }}
+    runs-on:
+      - self-hosted
+      - ${{ inputs.environment == 'production' && 'critical' || 'general' }}
+      - low-resource
+    needs:
+      - matrix
+      - dependencies
+      - pre-deploy
+    # Preview deployments: pre-deploy is skipped
+    # Rollback deployments: pre-deploy is skipped
+    # Production deployment: pre-deploy must pass
+    if: |
+      always() &&
+      contains(fromJSON('["success"]'), needs.dependencies.result) &&
+      contains(fromJSON('["success", "skipped"]'), needs.pre-deploy.result) &&
+      fromJson(needs.matrix.outputs.matrix).workers.include[0] != ''
+    strategy:
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix).workers }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.APOLLOIO_TOKEN }}
+
+      - name: Prepare for deployment
+        uses: ./.github/actions/setup-k8s
+        with:
+          clusterName: ${{ inputs.clusterName }}
+          clusterLocation: ${{ inputs.clusterLocation }}
+          workloadIdentityProvider: ${{ inputs.workloadIdentityProvider }}
+          workloadIdentityServiceAccount: ${{ inputs.workloadIdentityServiceAccount }}
+
+      - name: Patch preview values
+        if: ${{ inputs.environment == 'staging' }}
+        run: sed -i 's/{{gitBranchName}}/${{ inputs.gitBranchName }}/' kubernetes/staging/**/*.yaml
+
+      - name: Deploy
+        run: |
+          helm ${{ inputs.command }} \
+            --namespace ${{ inputs.namespace }} \
+            -f ${{ join(matrix.values, ' -f ') }} \
+            --set-string gitSha=${{ inputs.gitSha }} \
+            --set-string gitBranchName=${{ inputs.gitBranchName }} \
+            --set image.tag=${{ inputs.gitSha }} \
+            --wait --timeout 45m \
+            --description "commit=${{ inputs.gitSha }}" \
+            --history-max 50 \
+            ${{ matrix.name }} ${{ matrix.chart }}
+
+      - name: Helm rollback if status is in pending-upgrade
+        if: ${{ inputs.environment == 'staging' && failure() }}
+        run: ./scripts/helm-rollback/helm-rollback.sh ${{ matrix.name }} ${{ inputs.namespace }}
+
+  backend:
+    name: ${{ matrix.name }}
+    runs-on:
+      - self-hosted
+      - ${{ inputs.environment == 'production' && 'critical' || 'general' }}
+      - low-resource
+    needs:
+      - matrix
+      - pre-deploy
+      - workers
+    # Preview deployments: pre-deploy is skipped, workers may be skipped
+    # Rollback deployments: pre-deploy is skipped, workers may be skipped
+    # Production deployment: pre-deploy must pass, workers must pass
+    if: |
+      always() && !failure() &&
+      contains(fromJSON('["success", "skipped"]'), needs.pre-deploy.result) &&
+      contains(fromJSON('["success", "skipped"]'), needs.workers.result) &&
+      fromJson(needs.matrix.outputs.matrix).backend.include[0] != ''
+    strategy:
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix).backend }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.APOLLOIO_TOKEN }}
+
+      - name: Prepare for deployment
+        uses: ./.github/actions/setup-k8s
+        with:
+          clusterName: ${{ inputs.clusterName }}
+          clusterLocation: ${{ inputs.clusterLocation }}
+          workloadIdentityProvider: ${{ inputs.workloadIdentityProvider }}
+          workloadIdentityServiceAccount: ${{ inputs.workloadIdentityServiceAccount }}
+
+      - name: Patch preview values
+        if: ${{ inputs.environment == 'staging' }}
+        run: sed -i 's/{{gitBranchName}}/${{ inputs.gitBranchName }}/' kubernetes/staging/**/*.yaml
+
+      - name: Deploy
+        run: |
+          helm ${{ inputs.command }} \
+            --namespace ${{ inputs.namespace }} \
+            -f ${{ join(matrix.values, ' -f ') }} \
+            --set-string gitSha=${{ inputs.gitSha }} \
+            --set-string gitBranchName=${{ inputs.gitBranchName }} \
+            --set image.tag=${{ inputs.gitSha }} \
+            --wait --timeout 15m \
+            --description "commit=${{ inputs.gitSha }}" \
+            --history-max 50 \
+            ${{ matrix.name }} ${{ matrix.chart }}
+
+      - name: Helm rollback if status is in pending-upgrade
+        if: ${{ inputs.environment == 'staging' && failure() }}
+        run: ./scripts/helm-rollback/helm-rollback.sh ${{ matrix.name }} ${{ inputs.namespace }}
+
+  post-deploy:
+    name: 'Post: ${{ matrix.name }}'
+    continue-on-error: true
+    runs-on:
+      - self-hosted
+      - ${{ inputs.environment == 'production' && 'critical' || 'general' }}
+      - low-resource
+    needs:
+      - matrix
+      - backend
+    # Production deployment: backend must pass.
+    if: |
+      always() &&
+      contains(fromJSON('["success"]'), needs.backend.result) &&
+      fromJson(needs.matrix.outputs.matrix).postDeploy.include[0] != ''
+    strategy:
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix).postDeploy }}
+      fail-fast: false
+    env:
+      MIGRATIONS_FILE_PATH: 'db-migration-files/post-deploy'
+      MIGRATIONS_LOG_PATH: 'db-migration-logs/post-deploy'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.APOLLOIO_TOKEN }}
+          fetch-depth: 75
+
+      - name: Prepare for deployment
+        uses: ./.github/actions/setup-k8s
+        with:
+          clusterName: ${{ inputs.clusterName }}
+          clusterLocation: ${{ inputs.clusterLocation }}
+          workloadIdentityProvider: ${{ inputs.workloadIdentityProvider }}
+          workloadIdentityServiceAccount: ${{ inputs.workloadIdentityServiceAccount }}
+
+      - name: Deploy job
+        id: deploy
+        run: |
+          helm template ${{ matrix.name }} ${{ matrix.chart }} \
+            -f ${{ join(matrix.values, ' -f ') }} \
+            --set jobName=${{ matrix.name }} \
+            --set image.tag=${{ inputs.gitSha }} \
+            --set gitSha=${{ inputs.gitSha }} \
+            --set backoffLimit=0 \
+            --set railsCommand="${{ matrix.command }}" | \
+          kubectl apply -n ${{ inputs.namespace }} -f -
+          ./scripts/depenency-job-status-check/dependency_jobs_status.sh ${{ matrix.name }} ${{ inputs.namespace }} 30 24
+
+      - name: Display and upload pod logs to gcs bucket
+        if: always() && steps.deploy.conclusion != 'skipped'
+        run: |
+            ./scripts/db-migrations/check_pod_logs.sh -j "${{ matrix.name }}" -f "${{ matrix.name }}" -l 10 -s 60 -n ${{ inputs.namespace }} -e ${{ inputs.environment }}
+
+      - name: Slack Notification
+        if: ${{ always() && steps.deploy.outcome == 'failure' && inputs.environment == 'production' }}
+        uses: rtCamp/action-slack-notify@v2.3.1
+        env:
+          SLACK_MESSAGE: 'This <https://github.com/apolloio/leadgenie/actions/runs/${{ github.run_id }}|Post-deploy migration> failed. Deployment will continue without this migration. @oncall-eng-devops please take a look.'
+
+      # we only run this on production
+      - name: Deployment Marker
+        if: ${{ always() && inputs.environment == 'production'}}
+        uses: ./.github/actions/deployment-marker
+        with:
+          changeLog: ${{ inputs.gitSha }}
+          newRelicApiKey: ${{ secrets.NEW_RELIC_API_KEY }}
+          newRelicGuid: MTAwOTIzMnxBUE18QVBQTElDQVRJT058MTI3MzQ4OTQx
+          commitSha: ${{ inputs.gitSha }}
+
+  frontend:
+    runs-on:
+      - self-hosted
+      - ${{ inputs.environment == 'production' && 'critical' || 'general' }}
+      - low-resource
+    needs:
+      - matrix
+      - backend
+    if: |
+      always() &&
+      contains(fromJSON('["success"]'), needs.backend.result)
+    strategy:
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix).frontend }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.APOLLOIO_TOKEN }}
+
+      - name: Prepare for deployment
+        uses: ./.github/actions/setup-k8s
+        with:
+          clusterName: ${{ inputs.clusterName }}
+          clusterLocation: ${{ inputs.clusterLocation }}
+          workloadIdentityProvider: ${{ inputs.workloadIdentityProvider }}
+          workloadIdentityServiceAccount: ${{ inputs.workloadIdentityServiceAccount }}
+
+      - name: Patch preview values
+        if: ${{ inputs.environment == 'staging' }}
+        run: sed -i 's/{{gitBranchName}}/${{ inputs.gitBranchName }}/' kubernetes/staging/**/*.yaml
+
+      - name: Deploy
+        run: |
+          helm ${{ inputs.command }} \
+            --namespace ${{ inputs.namespace }} \
+            -f ${{ join(matrix.values, ' -f ') }} \
+            --set-string gitSha=${{ inputs.gitSha }} \
+            --set-string gitBranchName=${{ inputs.gitBranchName }} \
+            --set image.tag=${{ inputs.gitSha }} \
+            --wait --timeout 15m \
+            --description "commit=${{ inputs.gitSha }}" \
+            --history-max 50 \
+            ${{ matrix.name }} ${{ matrix.chart }}
+
+      - name: Helm rollback if status is in pending-upgrade
+        if: ${{ inputs.environment == 'staging' && failure() }}
+        run: ./scripts/helm-rollback/helm-rollback.sh ${{ matrix.name }} ${{ inputs.namespace }}
+
+      - name: Send deployment status to swarmia
+        if: ${{ inputs.environment == 'production' }}
+        run: |
+          JSON_STRING=$( jq --null-input --compact-output \
+            --arg version "${{ inputs.gitSha }}" \
+            --arg appName "leadgenie" \
+            --arg environment "production" \
+            '{"version": $version, "appName": $appName, "environment": $environment}' )
+
+          curl -H "Authorization: ${{ secrets.SWARMIA_DEPLOYMENTS_AUTHORIZATION }}" \
+            -H "Content-Type: application/json" \
+            -d "$JSON_STRING" \
+            https://hook.swarmia.com/deployments
+
+  notify:
+    needs:
+      - additional-resources
+      - frontend
+    if: |
+      always() &&
+      inputs.notify &&
+      contains(fromJSON('["success"]'), needs.frontend.result)
+    continue-on-error: true
+    runs-on:
+      - self-hosted
+      - critical
+      - low-resource
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.APOLLOIO_TOKEN }}
+      - name: Setup node and npm
+        uses: ./.github/actions/setup-node-and-npm
+        with:
+          token: ${{ secrets.FRONTEND_TOOLS_REPO_TOKEN_READ_ONLY }}
+      - run: npm install
+      - run: node ./scripts/notify-deployed-prs/index.js
+        env:
+          CURRENT_COMMIT: ${{ inputs.gitSha }}
+          GITHUB_TOKEN: ${{ secrets.APOLLOIO_TOKEN }}
+          LAST_DEPLOYED_COMMIT: ${{ needs.additional-resources.outputs.lastDeployedCommit }}
+          RUN_ID: ${{ github.run_id }}
+          SLACK_CHANNEL: eng-production-deployments
+          SLACK_TOKEN: ${{ secrets.SLACK_APP_PULL_REQUEST_DEPLOYMENTS }}

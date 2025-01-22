@@ -1,0 +1,214 @@
+name: Revert deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: 'Provide commit sha to revert'
+        required: true
+        type: string
+      skip_test:
+        description: Skip CI and migrations
+        type: boolean
+        required: false
+        default: true
+
+env:
+  RAILS_IMAGE: us-docker.pkg.dev/indigo-lotus-415/us.gcr.io/rails
+  SIDEKIQ_IMAGE: us-docker.pkg.dev/indigo-lotus-415/us.gcr.io/sidekiq
+  APP_IMAGE: us-docker.pkg.dev/indigo-lotus-415/us.gcr.io/app
+  SLACK_CHANNEL: eng-infrastructure-alerts
+  SLACK_COLOR: '#ff0000'
+  SLACK_ICON_EMOJI: ':apollo-logo:'
+  SLACK_USERNAME: Apollo Action Bot
+  SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+  MSG_MINIMAL: true
+  SLACK_FOOTER: ''
+  SLACK_LINK_NAMES: true
+
+concurrency:
+  group: leadgenie-revert-deployment
+  cancel-in-progress: false
+
+jobs:
+  lock-master:
+    runs-on:
+      - self-hosted
+      - general
+      - low-resource
+    steps:
+      - name: Lock Master Branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -X PUT \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/owner/repository/branches/master/protection \
+            -d '{
+              "lock_branch": true
+            }'
+
+  abort-pending-deployment:
+    runs-on:
+      - self-hosted
+      - general
+      - low-resource
+    steps:
+      - name: Abort Pending Production Deployments
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python ./scripts/abort-deployment.py
+
+  metadata:
+    timeout-minutes: 15
+    runs-on:
+      - self-hosted
+      - general
+      - low-resource
+    outputs:
+      git_sha: ${{ steps.sanitized_name.outputs.git_sha }}
+      git_branch_name: ${{ steps.sanitized_name.outputs.git_branch_name }}
+    steps:
+      - name: Identify target SHA
+        id: target_sha
+        run: ./identify_target_sha.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.APOLLOIO_TOKEN }}
+          ref: ${{ steps.target_sha.outputs.target_sha }}
+
+      - name: Create a new branch for the revert
+        run: |
+          # Generate a branch name
+          revert_branch="revert-${{ github.event.inputs.revert_sha }}-$(date +%s)"
+          git checkout -b "$revert_branch"
+          echo "branch_name=$revert_branch" >> $GITHUB_ENV
+
+      - name: Revert Commit
+        id: revert_commit
+        run: |
+          # Revert the user-specified SHA
+          git revert ${{ github.event.inputs.revert_sha }} --no-commit || echo "Conflict detected during revert"
+
+          # Commit the changes if no conflict
+          git commit -m "revert commit ${{ github.event.inputs.revert_sha }}"
+
+          if [ $? -ne 0 ]; then
+            echo "Conflict detected during commit. Exiting workflow."
+            exit 1  # Exit the workflow if there's a conflict during commit
+          fi
+
+          # Push to a new branch
+          git push origin $revert_branch
+
+      - name: Create Pull Request
+        if: ${{ steps.revert_commit.outcome == 'success' }}
+        run: |
+          # Create the pull request
+          pr_url=$(gh pr create \
+            --title "Revert ${{ github.event.inputs.revert_sha }}" \
+            --body "This PR reverts commit ${{ github.event.inputs.revert_sha }}" \
+            --head ${{ steps.revert_commit.outputs.branch_name }} \
+            --base master \
+            --label revert-deploy \
+            --json url \
+            -q '.url')
+          echo "Created PR: $pr_url"
+
+      - name: Check if PR is Mergeable and All Checks Passed
+        run: |
+          # Wait for the checks to pass and check mergeable status
+          pr_status=$(gh pr view $pr_url --json mergeable,checkSuites -q '.mergeable')
+          
+          if [[ "$pr_status" == "MERGEABLE" ]]; then
+            echo "PR is mergeable, proceeding to merge."
+            
+            # Ensure all checks have passed before merging
+            checks_passed=$(gh pr view $pr_url --json checkSuites -q '.checkSuites.nodes[].status' | grep -v "SUCCESS" || echo "NOT_SUCCESS")
+            
+            if [[ "$checks_passed" != "NOT_SUCCESS" ]]; then
+              # Merge the PR if all checks have passed
+              gh pr merge $pr_url --merge --admin
+              echo "PR has been merged successfully."
+            else
+              echo "Required checks have not passed. Aborting merge."
+              exit 1
+            fi
+          else
+            echo "PR is not mergeable. Aborting merge."
+            exit 1
+          fi
+
+      - name: Get sanitized ref name
+        id: sanitized_name
+        run: |
+          git_branch_name=$(echo ${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}} | sed "s/[^[:alnum:]]/-/g" | tr '[:upper:]' '[:lower:]' | head -c 38 | sed "s/-$//")
+          git_sha=$(git rev-parse HEAD)
+          echo "git_branch_name=${git_branch_name}" >> $GITHUB_OUTPUT
+          echo "git_sha=${git_sha}" >> $GITHUB_OUTPUT
+          echo "git_branch_name=${git_branch_name}"
+          echo "git_sha=${git_sha}"
+
+      - name: Check not a rerun
+        run: |
+          bash ./scripts/fail-if-rerun.sh ${{ github.run_attempt }}
+
+      - name: Skip CI summary
+        if: ${{ github.event.inputs.skip_test == 'true' }}
+        run: |
+          echo "# ⚠️ CI is skipped for this run" >> $GITHUB_STEP_SUMMARY
+          echo "## [@${{ github.actor }}](${{ github.event.sender.html_url }}) triggered this action" >> $GITHUB_STEP_SUMMARY
+
+      - name: Post artifacts destination
+        if: ${{ github.event.inputs.skip_test != 'true' }}
+        run: |
+          echo "### All action artifacts from this run are uploaded to Google Cloud Storage and will be kept for seven days from upload time" >> $GITHUB_STEP_SUMMARY
+          echo "Artifacts URL: https://console.cloud.google.com/storage/browser/apollo-ops_gha_artifacts/${{ github.repository }}/${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
+
+
+  unlock-master:
+    runs-on:
+      - self-hosted
+      - general
+      - low-resource
+    steps:
+      - name: Lock Master Branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -X PUT \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/owner/repository/branches/master/protection \
+            -d '{
+              "lock_branch": false
+            }'
+
+  alert-on-failure:
+    if: failure() && github.ref == 'refs/heads/master'
+    needs:
+      - metadata
+    runs-on:
+      - self-hosted
+      - critical
+      - low-resource
+    steps:
+      - name: Slack Notification
+        uses: rtCamp/action-slack-notify@v2.3.1
+        env:
+          SLACK_CHANNEL: eng-infrastructure-alerts
+          SLACK_COLOR: '#ff0000'
+          SLACK_ICON_EMOJI: ':apollo-logo:'
+          SLACK_MESSAGE: 'This <https://github.com/apolloio/leadgenie/actions/runs/${{ github.run_id }}|production pipeline> failed. @oncall-eng-devops please take a look.'
+          SLACK_TITLE: Prod Pipeline Failed
+          SLACK_USERNAME: Apollo Action Bot
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          MSG_MINIMAL: true
+          SLACK_FOOTER: ''
+          SLACK_LINK_NAMES: true
