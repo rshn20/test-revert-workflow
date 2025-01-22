@@ -1,0 +1,991 @@
+name: Production deployment
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - 'kubernetes/staging/**'
+  workflow_dispatch:
+    inputs:
+      skip_test:
+        description: Skip CI and migrations
+        type: boolean
+        required: false
+        default: false
+
+env:
+  RAILS_IMAGE: us-docker.pkg.dev/indigo-lotus-415/us.gcr.io/rails
+  SIDEKIQ_IMAGE: us-docker.pkg.dev/indigo-lotus-415/us.gcr.io/sidekiq
+  APP_IMAGE: us-docker.pkg.dev/indigo-lotus-415/us.gcr.io/app
+  RSPEC_FILE_PATTERN: spec/**/*_spec.rb
+  SLACK_CHANNEL: eng-infrastructure-alerts
+  SLACK_COLOR: '#ff0000'
+  SLACK_ICON_EMOJI: ':apollo-logo:'
+  SLACK_USERNAME: Apollo Action Bot
+  SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+  MSG_MINIMAL: true
+  SLACK_FOOTER: ''
+  SLACK_LINK_NAMES: true
+
+concurrency:
+  group: leadgenie-production-deployment
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    timeout-minutes: 15
+    runs-on:
+      - self-hosted
+      - ${{ github.ref == 'refs/heads/master' && 'critical' || 'general' }}
+      - low-resource
+    outputs:
+      git_sha: ${{ steps.sanitized_name.outputs.git_sha }}
+      git_branch_name: ${{ steps.sanitized_name.outputs.git_branch_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.APOLLOIO_TOKEN }}
+
+      - name: Get sanitized ref name
+        id: sanitized_name
+        run: |
+          git_branch_name=$(echo ${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}} | sed "s/[^[:alnum:]]/-/g" | tr '[:upper:]' '[:lower:]' | head -c 38 | sed "s/-$//")
+          git_sha=$(git rev-parse HEAD)
+          echo "git_branch_name=${git_branch_name}" >> $GITHUB_OUTPUT
+          echo "git_sha=${git_sha}" >> $GITHUB_OUTPUT
+          echo "git_branch_name=${git_branch_name}"
+          echo "git_sha=${git_sha}"
+
+      - name: Find Associated PR
+        id: find_pr
+        run: |
+          # Use GitHub CLI to find the PR associated with the commit
+          pr_number=$(gh pr list --search "base:master head:${{ github.sha }}" --json number -q '.[0].number')
+          if [ -z "$pr_number" ]; then
+            echo "No associated PR found for this commit."
+            echo "pr_number=" >> $GITHUB_ENV
+          else
+            echo "Found PR: $pr_number"
+            echo "pr_number=$pr_number" >> $GITHUB_ENV
+          fi
+
+      - name: Fetch PR Labels
+        id: fetch_labels
+        if: env.pr_number
+        run: |
+          # Fetch the labels of the identified PR
+          labels=$(gh pr view ${{ env.pr_number }} --json labels -q '.labels[].name')
+          echo "Labels on PR: $labels"
+          echo "labels=$labels" >> $GITHUB_ENV
+
+      - name: Check not a rerun
+        run: |
+          bash ./scripts/fail-if-rerun.sh ${{ github.run_attempt}}
+
+      - name: Skip CI summary
+        if: ${{ github.event.inputs.skip_test != 'true' && !contains(github.event.inputs.labels, 'revert-deploy') }}
+        run: |
+          echo "# ⚠️ CI is skipped for this run" >> $GITHUB_STEP_SUMMARY
+          echo "## [@${{ github.actor }}](${{ github.event.sender.html_url }}) triggered this action" >> $GITHUB_STEP_SUMMARY
+
+      - name: Post artifacts destination
+        if: ${{ github.event.inputs.skip_test != 'true' && !contains(github.event.inputs.labels, 'revert-deploy') }}
+        run: |
+          echo "### All action artifacts from this run are uploaded to Google Cloud Storage and will be kept for seven days from upload time" >> $GITHUB_STEP_SUMMARY
+          echo "Artifacts URL: https://console.cloud.google.com/storage/browser/apollo-ops_gha_artifacts/${{ github.repository }}/${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
+
+  cypress-build-id:
+    if: ${{ github.event.inputs.skip_test != 'true' && !contains(github.event.inputs.labels, 'revert-deploy') }}
+    timeout-minutes: 15
+    runs-on:
+      - self-hosted
+      - ${{ github.ref == 'refs/heads/master' && 'critical' || 'general' }}
+      - low-resource
+    outputs:
+      cypress-build-id: ${{ steps.build-id.outputs.build-id }}
+    steps:
+      - name: Generate consistent build id for cypress
+        id: build-id
+        run: echo "build-id=${{ github.repository }}-${{ github.run_id }}-${{ github.run_attempt }}" >> $GITHUB_OUTPUT
+
+  build-test-rails-image:
+    if: ${{ github.event.inputs.skip_test != 'true' && !contains(github.event.inputs.labels, 'revert-deploy') }}
+    timeout-minutes: 15
+    needs:
+      - metadata
+    runs-on:
+      - self-hosted
+      - ${{ github.ref == 'refs/heads/master' && 'critical' || 'general' }}
+      - high-resource
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    env:
+      RAILS_TEST_IMAGE_REPO: us-docker.pkg.dev/apollo-ops/us.gcr.io/rails-test-ci
+      RAILS_ENV: test
+      GIT_COMMIT_HASH: ${{ needs.metadata.outputs.git_sha }}
+    outputs:
+      rails-image: ${{ steps.build.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          token: ${{ secrets.APOLLOIO_TOKEN }}
+
+      - name: Check not a rerun
+        run: |
+          bash ./scripts/fail-if-rerun.sh ${{ github.run_attempt}}
+
+      - name: Copy ignore file
+        run: |
+          cp docker/rails/test/.dockerignore .dockerignore
+
+      - name: Configure docker
+        run: |
+          docker context create builders
+
+      - name: Set up docker buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: latest
+          endpoint: builders
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: |
+            ${{ env.RAILS_TEST_IMAGE_REPO }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.RAILS_TEST_IMAGE_REPO }}:buildcache
+          cache-to: type=registry,ref=${{ env.RAILS_TEST_IMAGE_REPO }}:buildcache,mode=max
+          file: docker/rails/test/Dockerfile
+          context: .
+          load: true
+          build-args: |
+            GENERATE_STATIC_DATA=true
+            GIT_COMMIT_HASH=${{ env.GIT_COMMIT_HASH }}
+          secrets: |
+            contribsys=${{ secrets.CONTRIBSYS_ACCESS_KEY }}
+
+      - name: Upload static data to GCS
+        run: |
+          mkdir -p /tmp/static_data
+          docker create --name build ${{ env.RAILS_TEST_IMAGE_REPO }}:${{ github.sha }}
+          docker cp build:/home/app/webapp/public/static_data /tmp  # creates static_data directory under /tmp
+          gsutil -h "Cache-Control:public, immutable" -m cp -v -r /tmp/static_data/ gs://api-public-assets
+
+      - name: Set output
+        id: build
+        run: |
+          echo "image=${{ env.RAILS_TEST_IMAGE_REPO }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  build-test-app-image:
+    if: ${{ github.event.inputs.skip_test != 'true' && !contains(github.event.inputs.labels, 'revert-deploy') }}
+    timeout-minutes: 45
+    needs:
+      - metadata
+    runs-on:
+      - self-hosted
+      - ${{ github.ref == 'refs/heads/master' && 'critical' || 'general' }}
+      - high-resource
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    env:
+      APP_TEST_IMAGE_REPO: us-docker.pkg.dev/apollo-ops/us.gcr.io/app-test-ci
+      NODE_ENV: production
+      APP_ENV: test
+    outputs:
+      app-image: ${{ steps.build.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          token: ${{ secrets.APOLLOIO_TOKEN }}
+
+      - name: Check not a rerun
+        run: |
+          bash ./scripts/fail-if-rerun.sh ${{ github.run_attempt}}
+
+      - name: Copy ignore file
+        run: |
+          cp docker/app/test/.dockerignore .dockerignore
+
+      - name: Configure docker
+        run: |
+          docker context create builders
+
+      - name: Set up docker buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: latest
+          endpoint: builders
+
+      - name: choose_whether_to_sample_image_metrics
+        run: |
+          random_number=$((RANDOM % 25))
+          if [ $random_number -eq 0 ]; then
+            echo "random_number=$random_number, GET_IMG_METRICS=true"
+            echo "GET_IMG_METRICS=true" >> $GITHUB_ENV
+          else
+            echo "random_number=$random_number, GET_IMG_METRICS=false"
+            echo "GET_IMG_METRICS=false" >> $GITHUB_ENV
+          fi
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: |
+            ${{ env.APP_TEST_IMAGE_REPO }}:${{ github.sha }}
+            ${{ env.APP_TEST_IMAGE_REPO }}:latest
+          cache-from: type=registry,ref=${{ env.APP_TEST_IMAGE_REPO }}:buildcache
+          cache-to: type=registry,ref=${{ env.APP_TEST_IMAGE_REPO }}:buildcache
+          file: docker/app/test/Dockerfile
+          context: .
+          load: ${{ env.GET_IMG_METRICS == 'true' }}
+          build-args: |
+            GIT_TOKEN=${{ secrets.FRONTEND_TOOLS_REPO_TOKEN_READ_ONLY }}
+            RAILS_HOST=localhost:4001
+            BUILD_COMMAND=npm run build:app:test
+            EXTENSION_COMMAND=npm run build:extension:test
+
+      - name: Send Docker Image Size to Metrics Server
+        if: ${{ env.GET_IMG_METRICS == 'true' }}
+        uses: ./.github/actions/metrics/send-docker-image-metrics
+        with:
+          image-repo: ${{ env.APP_TEST_IMAGE_REPO }}
+          tag: ${{ github.sha }}
+          metric-name: 'image.app_test_ci.size'
+
+      - name: Set output
+        id: build
+        run: |
+          echo "image=${{ env.APP_TEST_IMAGE_REPO }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  brakeman:
+    timeout-minutes: 30
+    runs-on:
+      - self-hosted
+      - ${{ github.ref == 'refs/heads/master' && 'critical' || 'general' }}
+      - mid-resource
+    needs:
+      - metadata
+      - build-test-rails-image
+    container:
+      image: ${{ needs.build-test-rails-image.outputs.rails-image }}
+      options: --dns-opt ndots:1 --user root
+    steps:
+      - name: Run brakeman
+        run: |
+          su app
+          cd /home/app/webapp
+          # --------------------
+          mkdir brakeman
+          bundle exec brakeman -w2 -i config/brakeman.ignore -o brakeman/results.html -o brakeman/results.json
+
+      - name: Upload brakeman results to cloud
+        id: upload_brakeman_results
+        continue-on-error: true
+        if: success() || failure()
+        run: |
+          cd /home/app/webapp
+          # --------------------
+          bash ./scripts/gcs/gcloud_storage_cp.sh -r brakeman gs://apollo-ops_gha_artifacts/${{ github.repository }}/${{ github.run_id }}/${{ github.run_attempt }}-brakeman
+
+      - name: Notify GCS upload failures
+        if: ${{ steps.upload_brakeman_results.outcome != 'success' }}
+        uses: rtCamp/action-slack-notify@v2.3.1
+        env:
+          SLACK_MESSAGE: 'This <https://github.com/apolloio/leadgenie/actions/runs/${{ github.run_id }}|production pipeline> could not upload brakeman results to GCS. @oncall-eng-devops please take a look.'
+          SLACK_TITLE: 'Brakeman Upload Failure Notification'
+
+  rspec:
+    timeout-minutes: 60
+    runs-on:
+      - self-hosted
+      - ${{ github.ref == 'refs/heads/master' && 'critical' || 'general' }}
+      - high-resource
+    needs:
+      - metadata
+      - build-test-rails-image
+    container:
+      image: ${{ needs.build-test-rails-image.outputs.rails-image }}
+      options: --dns-opt ndots:1 --user root
+    env:
+      RAILS_ENV: test
+      CI: true
+    services:
+      mongo:
+        image: mongo:5.0.22
+        # TODO(Farhad): Remove these type of health checks and use wait-fot-it because this is synchronous
+        options: >-
+          --health-cmd "mongo --eval 'db.runCommand({ connectionStatus: 1 })' || exit 1"
+          --health-start-period 15s
+          --health-interval 10s
+          --health-timeout 3s
+          --health-retries 12
+        ports:
+          - 27017:27017
+      elasticsearch:
+        image: 'us-docker.pkg.dev/apollo-ops/us.gcr.io/elasticsearch-base:7.17.10'
+        options: >-
+          --health-cmd "curl -f http://localhost:9200/_cluster/health || exit 1"
+          --health-start-period 15s
+          --health-interval 10s
+          --health-timeout 3s
+          --health-retries 12
+        env:
+          discovery.type: single-node
+          search.max_open_scroll_context: '1000000'
+          cluster.max_shards_per_node: '1000000'
+          ES_JAVA_OPTS: '-Xms2048m -Xmx2048m'
+          reindex.remote.whitelist: elasticsearch:9200
+        ports:
+          - 9200:9200
+    strategy:
+      fail-fast: false
+      matrix:
+        ci_node_total: ${{ fromJson('[30]')}}
+        ci_node_index: ${{ fromJson('[ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29 ]') }}
+    steps:
+      - name: Check not a rerun
+        run: |
+          cd /home/app/webapp
+          bash ./scripts/fail-if-rerun.sh ${{ github.run_attempt}}
+
+      - name: Run rspec
+        env:
+          CI_NODE_TOTAL: ${{ matrix.ci_node_total }}
+          CI_NODE_INDEX: ${{ matrix.ci_node_index }}
+          MONGO_ENDPOINT: mongo:${{ job.services.mongo.ports[27017] }}
+          ES_ENDPOINT: elasticsearch:${{ job.services.elasticsearch.ports[9200] }}
+        run: |
+          su app
+          cd /home/app/webapp
+          bash ./scripts/gcs/gcloud_storage_cp.sh "gs://apollo-ops_gha_artifacts/knapsack_rspec_report.json" . || true
+          # --------------------
+          bundle exec rake db:mongoid:create_indexes
+          export SKIP_COVERAGE=1
+
+          # --------------------
+          # Retry RSpec tests once if a segmentation fault occurs
+          segfault_exit_code=139
+          max_attempts=2
+          attempt=1
+
+          while [ $attempt -le $max_attempts ]; do
+            KNAPSACK_REPORT_PATH="knapsack_rspec_report.json" \
+            KNAPSACK_GENERATE_REPORT=true \
+            KNAPSACK_TEST_FILE_PATTERN="${{ env.RSPEC_FILE_PATTERN }}" \
+            set +e
+            bundle exec rake "knapsack:rspec[--format progress --backtrace --format RspecJunitFormatter --out rspec/rspec.xml --tag ~external --tag ~type:feature --tag ~pre_update_mapping_tests]"
+            exit_code=$?
+            set -e
+
+            if [ $exit_code -ne $segfault_exit_code ]; then
+              exit $exit_code
+            fi
+
+            echo "---------------------------------------------"
+            echo "RSpec segmentation fault detected. Retrying..."
+            echo "---------------------------------------------"
+            attempt=$((attempt + 1))
+          done
+
+          echo "RSpec failed after $max_attempts attempts due to recurring segfaults."
+          exit $segfault_exit_code
+
+      - name: Validate unit test result files
+        id: xml_exist
+        if: success() || failure()
+        run: |
+          cd /home/app/webapp
+          # --------------------
+          (test -f rspec/rspec.xml && echo "xml=true" >> $GITHUB_OUTPUT ) || echo "No xml file is present"
+
+      - name: Upload files to cloud
+        id: upload_rspec_results
+        continue-on-error: true
+        if: ${{ (success() || failure()) && steps.xml_exist.outputs.xml }}
+        run: |
+          cd /home/app/webapp
+          # --------------------
+          SUFFIX=${{ matrix.ci_node_total }}-${{ matrix.ci_node_index }}
+          cp rspec/rspec.xml rspec-$SUFFIX.xml || echo "File rspec/rspec.xml file does not exist"
+          cp coverage/.resultset.json rspec-coverage-$SUFFIX.json || echo "File coverage/.resultset.json does not exist"
+          cp knapsack_rspec_report.json rspec-knapsack-$SUFFIX.json || echo "File knapsack_rspec_report.json does not exist"
+          # upload files
+          bash ./scripts/gcs/gcloud_storage_cp.sh -r rspec*-$SUFFIX.* gs://apollo-ops_gha_artifacts/${{ github.repository }}/${{ github.run_id }}/rspec/
+
+      - name: Notify
+        if: failure()
+        working-directory: /home/app/webapp/scripts/notify-failed-tests
+        env:
+          GITHUB_TOKEN: ${{ secrets.APOLLOIO_TOKEN }}
+          COMMIT: ${{ needs.metadata.outputs.git_sha }}
+          SLACK_TOKEN: ${{ secrets.SLACK_APP_PULL_REQUEST_DEPLOYMENTS }}
+          SLACK_CHANNEL: eng-production-deployments
+          RUN_ID: ${{ github.run_id }}
+          TEST_TYPE: rspec
+        run: |
+          npm install
+          node index.js
+
+      - name: Notify GCS upload failures
+        if: ${{ steps.upload_rspec_results.outcome != 'success' }}
+        uses: rtCamp/action-slack-notify@v2.3.1
+        env:
+          SLACK_MESSAGE: 'This <https://github.com/apolloio/leadgenie/actions/runs/${{ github.run_id }}|production pipeline> could not upload rspec results to GCS. @oncall-eng-devops please take a look.'
+          SLACK_TITLE: 'Rspec Upload Failure Notification'
+
+  cypress:
+    timeout-minutes: 90
+    runs-on:
+      - self-hosted
+      - ${{ github.ref == 'refs/heads/master' && 'critical' || 'general' }}
+      - high-resource
+    needs:
+      - metadata
+      - build-test-rails-image
+      - build-test-app-image
+      - cypress-build-id
+    strategy:
+      fail-fast: false
+      matrix:
+        ci_node_total: [12]
+        ci_node_index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    container:
+      image: ${{ needs.build-test-app-image.outputs.app-image }}
+      options: --dns-opt ndots:1 --user root
+    services:
+      rails:
+        image: ${{ needs.build-test-rails-image.outputs.rails-image }}
+        options: --restart on-failure
+        env:
+          RAILS_ENV: test
+          MONGO_ENDPOINT: mongo:27017
+          ES_ENDPOINT: elasticsearch:9200
+          CYPRESS: 1
+          CREATE_MONGO_INDEX: true
+          CI: true
+        ports:
+          - 3001:3001
+      mongo:
+        image: 'mongo:5.0.22'
+        ports:
+          - 27017:27017
+      elasticsearch:
+        image: 'us-docker.pkg.dev/apollo-ops/us.gcr.io/elasticsearch-base:7.17.10'
+        env:
+          discovery.type: single-node
+          search.max_open_scroll_context: '1000000'
+          cluster.max_shards_per_node: '1000000'
+          ES_JAVA_OPTS: '-Xms2048m -Xmx2048m'
+          reindex.remote.whitelist: elasticsearch:9200
+        ports:
+          - 9200:9200
+    env:
+      NODE_ENV: production
+      APP_ENV: test
+      CYPRESS_COVERAGE: false
+      CYPRESS_EXTENSION_MODE: test
+      GIT_COMMIT_HASH: ${{ github.sha }}
+      CYPRESS_API_URL: http://sorrycypress-director.sorrycypress:1234/
+      APP_BASE_URL: https://localhost:4001
+      RAILS_HOST: rails:3001
+      PROXY_TARGET: https://rails:3001/api
+      CYPRESS_RETRIES: 3
+      UPLOAD_ALL_CYPRESS_VIDEOS: false
+    steps:
+      - name: Check if job is being partially re-run (see error log)
+        run: |
+          initial_run_attempt=$(echo ${{ needs.cypress-build-id.outputs.cypress-build-id }} | cut -d "-" -f 3)
+          current_run_attempt=${{ github.run_attempt }}
+          if [ $initial_run_attempt -ne $current_run_attempt ]; then
+            echo "You cannot re-run failed cypress jobs individually"
+            echo "Please re-run the entire workflow or ping DevOps if this is a different situation"
+            echo "Cypress integrity check failed. Build id generated for: $initial_run_attempt, but current run is: $current_run_attempt"
+            exit 1
+          fi
+
+      - name: Start FE app
+        run: |
+          cd /leadgenie
+          npm run serve:build &
+
+      - name: Wait for all service to be up
+        run: |
+          wait-for-it -t 120 rails:3001 &
+          p1=$!
+          wait-for-it -t 60 localhost:4001 &
+          p2=$!
+          wait-for-it -t 60 mongo:27017 &
+          p3=$!
+          wait-for-it -t 60 elasticsearch:9200 &
+          p4=$!
+          wait $p1 $p2 $p3 $p4
+
+      - name: Run cypress
+        id: run_cypress
+        continue-on-error: true
+        env:
+          HOME: /root
+        run: |
+          cd /leadgenie
+          # run cypress
+          npx currents run \
+            --browser /usr/bin/google-chrome-stable \
+            --headed \
+            --parallel \
+            --record \
+            --key ${{ secrets.CYPRESS_CURRENTS_KEY }} \
+            --ci-build-id ${{needs.cypress-build-id.outputs.cypress-build-id}} \
+            --spec 'cypress/e2e/core/**/*.spec.ts' \
+            --reporter junit \
+            --reporter-options "mochaFile=cypress-[hash].xml,toConsole=true"
+
+      - name: Re-run Failed Cypress Tests
+        id: re_run_cypress
+        # re-run failed tests in case they're flaky
+        env:
+          HOME: /root
+          cypress_run_outcome: ${{ steps.run_cypress.outcome }}
+          CYPRESS_TRASH_ASSETS_BEFORE_RUNS: 'false'
+        run: |
+          bash /leadgenie/scripts/rerun-cypress/rerun-production-cypress.sh ${{matrix.ci_node_index}} ${{needs.cypress-build-id.outputs.cypress-build-id}} ${{ secrets.CYPRESS_CURRENTS_KEY }}
+
+      - name: Notify
+        if: failure()
+        working-directory: /leadgenie/scripts/notify-failed-tests
+        env:
+          GITHUB_TOKEN: ${{ secrets.APOLLOIO_TOKEN }}
+          COMMIT: ${{ needs.metadata.outputs.git_sha }}
+          SLACK_TOKEN: ${{ secrets.SLACK_APP_PULL_REQUEST_DEPLOYMENTS }}
+          SLACK_CHANNEL: eng-production-deployments
+          RUN_ID: ${{ github.run_id }}
+          TEST_TYPE: cypress
+        run: |
+          npm install
+          node index.js
+
+      - name: Create Flaky Test Incidents
+        id: create-flaky-test-incidents
+        if: ${{ success() && steps.run_cypress.outcome != 'success'}}
+        working-directory: /leadgenie/scripts/jira-incident-failed-tests
+        env:
+          JIRA_QA_USER_EMAIL: ${{ vars.JIRA_QA_USER_EMAIL }}
+          JIRA_QA_API_TOKEN: ${{ secrets.JIRA_QA_API_TOKEN }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          RUN_ID: ${{ github.run_id }}
+          MATRIX_TOTAL: ${{ matrix.ci_node_total }}
+          MATRIX_INDEX: ${{ matrix.ci_node_index }}
+        run: node jira-incident-failed-tests.js
+        continue-on-error: true
+
+      - name: Send notification for failed "Create Flaky Test Incidents" step
+        if: ${{ steps.create-flaky-test-incidents.outcome != 'success' && steps.create-flaky-test-incidents.outcome != 'skipped'}}
+        uses: rtCamp/action-slack-notify@v2.3.1
+        env:
+          SLACK_CHANNEL: proj-deployment-pipeline
+          SLACK_COLOR: '#ff6600'
+          SLACK_ICON_EMOJI: ':apollo-logo:'
+          SLACK_MESSAGE: |
+            Flaky Test Jira Incidents creation fail.
+            <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}?check_suite_focus=true#${{ github.job }}|See job summary for details.>
+          SLACK_TITLE: 'Flaky Test Jira Incidents creation fail'
+          SLACK_USERNAME: Apollo Action Bot
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          MSG_MINIMAL: true
+          SLACK_FOOTER: ''
+          SLACK_LINK_NAMES: true
+
+      - name: Send Flaky Test Notifications
+        if: ${{ success() && steps.run_cypress.outcome != 'success' }}
+        uses: rtCamp/action-slack-notify@v2.3.1
+        env:
+          SLACK_CHANNEL: proj-deployment-pipeline
+          SLACK_COLOR: '#ff0000'
+          SLACK_ICON_EMOJI: ':apollo-logo:'
+          SLACK_MESSAGE: |
+            <${{ github.event.pull_request.html_url }}|${{ github.event.pull_request.title }}> has flaky cypress tests.
+            <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}?check_suite_focus=true#${{ github.job }}|See job summary for details.>
+            <https://console.cloud.google.com/storage/browser/apollo-ops_gha_artifacts/apolloio/leadgenie/${{ github.run_id }}| Check screenshots/videos here>
+            Flaky specs: ${{ steps.re_run_cypress.outputs.spec_list }}
+          SLACK_TITLE: 'Flaky Cypress Test Notification'
+          SLACK_USERNAME: Apollo Action Bot
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          MSG_MINIMAL: true
+          SLACK_FOOTER: ''
+          SLACK_LINK_NAMES: true
+
+      - name: Validate unit test result files
+        id: check_files
+        if: success() || failure()
+        run: |
+          ls /leadgenie/cypress-*.xml > /dev/null 2>&1 && echo "xml_present=true" >> $GITHUB_OUTPUT || echo "No XML file found"
+          ls -R /leadgenie/cypress/videos | grep '\.mp4' > /dev/null 2>&1 && echo "video_present=true" >> $GITHUB_OUTPUT || echo "No video file found"
+          ls /leadgenie/cypress/screenshots > /dev/null 2>&1 && echo "screenshots_present=true" >> $GITHUB_OUTPUT || echo "No screenshot file found"
+
+      - name: Delete empty Cypress videos directories
+        if: always()
+        run: |
+          if [ -d "/leadgenie/cypress/videos" ]; then
+            cd /leadgenie/cypress/videos
+            find . -mindepth 1 -type d -empty -delete
+          else
+            echo "Cypress videos directory not found"
+          fi
+
+      - name: Upload cypress results to cloud
+        id: upload_cypress_results
+        continue-on-error: true
+        if: ${{ (success() || failure()) && steps.check_files.outputs.xml_present == 'true' }}
+        run: |
+          mkdir cypress-results
+          cp -r /leadgenie/cypress-*.xml cypress-results
+          bash /leadgenie/scripts/gcs/gcloud_storage_cp.sh -r cypress-results/* gs://apollo-ops_gha_artifacts/${{ github.repository }}/${{ github.run_id }}/${{ github.run_attempt }}-cypress-unit-test-results/
+
+      - name: Upload cypress videos to cloud
+        id: upload_cypress_videos
+        continue-on-error: true
+        if: ${{ (success() || failure()) && steps.check_files.outputs.video_present == 'true' }}
+        run: |
+          bash /leadgenie/scripts/gcs/gcloud_storage_cp.sh -r /leadgenie/cypress/videos/* gs://apollo-ops_gha_artifacts/${{ github.repository }}/${{ github.run_id }}/${{ github.run_attempt }}-cypress-unit-test-videos/
+
+      - name: Upload cypress screenshots to cloud
+        id: upload_cypress_screenshots
+        continue-on-error: true
+        if: ${{ (success() || failure()) && steps.check_files.outputs.screenshots_present == 'true' }}
+        run: |
+          bash /leadgenie/scripts/gcs/gcloud_storage_cp.sh -r /leadgenie/cypress/screenshots/* gs://apollo-ops_gha_artifacts/${{ github.repository }}/${{ github.run_id }}/${{ github.run_attempt }}-cypress-unit-test-screenshots/
+
+      - name: Notify GCS upload failures
+        if: |
+          steps.upload_cypress_results.outcome == 'failure' ||
+          steps.upload_cypress_videos.outcome == 'failure' ||
+          steps.upload_cypress_screenshots.outcome == 'failure'
+        uses: rtCamp/action-slack-notify@v2.3.1
+        env:
+          SLACK_MESSAGE: 'This <https://github.com/apolloio/leadgenie/actions/runs/${{ github.run_id }}|production pipeline> could not upload cypress results to GCS. @oncall-eng-devops please take a look.'
+          SLACK_TITLE: 'Cypress Upload Failure Notification'
+
+  eslint:
+    timeout-minutes: 45
+    needs:
+      - build-test-app-image
+    runs-on:
+      - self-hosted
+      - ${{ github.ref == 'refs/heads/master' && 'critical' || 'general' }}
+      - high-resource
+    container:
+      image: ${{ needs.build-test-app-image.outputs.app-image }}
+      options: --dns-opt ndots:1 --user root
+    env:
+      NODE_OPTIONS: '--max_old_space_size=6144' # 6GB since high-resource has 9GB of RAM
+    steps:
+      - name: Run eslint check
+        run: |
+          cd /leadgenie
+          # running eslint with the :deploy option uses .eslintrc.prod.js file
+          npm run eslint:check:deploy
+
+      - name: Run stylelint check
+        run: |
+          cd /leadgenie
+          npm run stylelint:check:deploy
+
+  build-prod-app-image:
+    timeout-minutes: 45
+    needs: metadata
+    runs-on:
+      - self-hosted
+      - ${{ github.ref == 'refs/heads/master' && 'critical' || 'general' }}
+      - high-resource
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    env:
+      GIT_COMMIT_HASH: ${{ needs.metadata.outputs.git_sha }}
+      GIT_BRANCH_NAME: ${{ needs.metadata.outputs.git_branch_name }}
+      NODE_OPTIONS: '--max_old_space_size=6144' # 6GB since high-resource has 7GB of RAM
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.APOLLOIO_TOKEN }}
+
+      - name: Check not a rerun
+        run: |
+          bash ./scripts/fail-if-rerun.sh ${{ github.run_attempt}}
+
+      - name: Gcloud auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/499298628135/locations/global/workloadIdentityPools/prod-gh-pool/providers/gh-action-provider'
+          service_account: 'prod-gcloud-access@indigo-lotus-415.iam.gserviceaccount.com'
+
+      - name: Configure docker
+        run: |
+          gcloud auth configure-docker us-docker.pkg.dev --quiet
+          docker context create builders
+
+      - name: Set up docker buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: latest
+          endpoint: builders
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: |
+            ${{ env.APP_IMAGE }}:${{ env.GIT_BRANCH_NAME }}-latest
+            ${{ env.APP_IMAGE }}:${{ env.GIT_BRANCH_NAME }}-${{ env.GIT_COMMIT_HASH }}
+            ${{ env.APP_IMAGE }}:${{ env.GIT_COMMIT_HASH }}
+            ${{ env.APP_IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.APP_IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.APP_IMAGE }}:buildcache,mode=max
+          file: docker/app/prod/Dockerfile
+          context: .
+          target: main
+          build-args: |
+            NODE_ENV=production
+            APP_ENV=production
+            SENTRY_RELEASE=${{ env.GIT_COMMIT_HASH }}
+            SENTRY_AUTH_TOKEN=${{ secrets.SENTRY_AUTH_TOKEN }}
+            GIT_COMMIT_HASH=${{ env.GIT_COMMIT_HASH }}
+            GITHUB_HEAD_REF_SANE=${{ env.GIT_BRANCH_NAME }}
+
+      - name: Publish assets
+        run: |
+          mkdir -p /tmp/var/www
+          docker pull ${{ env.APP_IMAGE }}:${GIT_BRANCH_NAME}-${GIT_COMMIT_HASH}
+          docker create --name build ${{ env.APP_IMAGE }}:${GIT_BRANCH_NAME}-${GIT_COMMIT_HASH}
+          docker cp build:/var/www/js/. /tmp/var/www/js
+          docker cp build:/var/www/imgs/. /tmp/var/www/imgs
+          docker cp build:/var/www/fonts/. /tmp/var/www/fonts
+
+          # Directories that have hashed files and can be cached forever go here (Cache-Control: immutable)
+          # IMPORTANT: Be careful not to add "Cache-Control: immutable" to files that have the same name even when updated (eg. index.html)
+          # IMPORTANT: Make sure that the new kinds of files you add are gzipped IFF they should be gzipped (jpg, png should not be gzipped)
+          gsutil -h "Cache-Control:no-transform, public, immutable" -m cp -v -z "js" -r /tmp/var/www/js/ gs://app-public-assets
+          gsutil -h "Cache-Control:no-transform, public, immutable" -m cp -v -z "svg" -r /tmp/var/www/imgs/ gs://app-public-assets
+          gsutil -h "Cache-Control:no-transform, public, immutable" -m cp -v -r /tmp/var/www/fonts/ gs://app-public-assets
+
+  build-prod-rails-image:
+    timeout-minutes: 15
+    needs: metadata
+    runs-on:
+      - self-hosted
+      - ${{ github.ref == 'refs/heads/master' && 'critical' || 'general' }}
+      - high-resource
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    env:
+      GIT_COMMIT_HASH: ${{ needs.metadata.outputs.git_sha }}
+      GIT_BRANCH_NAME: ${{ needs.metadata.outputs.git_branch_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.APOLLOIO_TOKEN }}
+
+      - name: Check not a rerun
+        run: |
+          bash ./scripts/fail-if-rerun.sh ${{ github.run_attempt}}
+
+      - name: Gcloud auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/499298628135/locations/global/workloadIdentityPools/prod-gh-pool/providers/gh-action-provider'
+          service_account: 'prod-gcloud-access@indigo-lotus-415.iam.gserviceaccount.com'
+
+      - name: Configure docker
+        run: |
+          gcloud auth configure-docker us-docker.pkg.dev --quiet
+          docker context create builders
+
+      - name: Set up docker buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: latest
+          endpoint: builders
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: |
+            ${{ env.RAILS_IMAGE }}:${{ env.GIT_BRANCH_NAME }}-latest
+            ${{ env.RAILS_IMAGE }}:${{ env.GIT_BRANCH_NAME }}-${{ env.GIT_COMMIT_HASH }}
+            ${{ env.RAILS_IMAGE }}:${{ env.GIT_COMMIT_HASH }}
+            ${{ env.RAILS_IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.RAILS_IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.RAILS_IMAGE }}:buildcache
+          file: docker/rails/prod/Dockerfile
+          context: .
+          build-args: |
+            GIT_COMMIT_HASH=${{ env.GIT_COMMIT_HASH }}
+          secrets: |
+            contribsys=${{ secrets.CONTRIBSYS_ACCESS_KEY }}
+
+  build-prod-sidekiq-image:
+    timeout-minutes: 15
+    needs: metadata
+    runs-on:
+      - self-hosted
+      - ${{ github.ref == 'refs/heads/master' && 'critical' || 'general' }}
+      - high-resource
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    env:
+      GIT_COMMIT_HASH: ${{ needs.metadata.outputs.git_sha }}
+      GIT_BRANCH_NAME: ${{ needs.metadata.outputs.git_branch_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.APOLLOIO_TOKEN }}
+
+      - name: Check not a rerun
+        run: |
+          bash ./scripts/fail-if-rerun.sh ${{ github.run_attempt}}
+
+      - name: Gcloud auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/499298628135/locations/global/workloadIdentityPools/prod-gh-pool/providers/gh-action-provider'
+          service_account: 'prod-gcloud-access@indigo-lotus-415.iam.gserviceaccount.com'
+
+      - name: Configure docker
+        run: |
+          gcloud auth configure-docker us-docker.pkg.dev --quiet
+          docker context create builders
+
+      - name: Set up docker buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: latest
+          endpoint: builders
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: |
+            ${{ env.SIDEKIQ_IMAGE }}:${{ env.GIT_BRANCH_NAME }}-latest
+            ${{ env.SIDEKIQ_IMAGE }}:${{ env.GIT_BRANCH_NAME }}-${{ env.GIT_COMMIT_HASH }}
+            ${{ env.SIDEKIQ_IMAGE }}:${{ env.GIT_COMMIT_HASH }}
+            ${{ env.SIDEKIQ_IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.SIDEKIQ_IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.SIDEKIQ_IMAGE }}:buildcache
+          file: docker/sidekiq/prod/Dockerfile
+          context: .
+          build-args: |
+            GIT_COMMIT_HASH=${{ env.GIT_COMMIT_HASH }}
+          secrets: |
+            contribsys=${{ secrets.CONTRIBSYS_ACCESS_KEY }}
+
+  test-results:
+    runs-on:
+      - self-hosted
+      - ${{ github.ref == 'refs/heads/master' && 'critical' || 'general' }}
+      - low-resource
+    if: ${{ success() || failure() || (github.event.inputs.skip_test != 'true' && !contains(github.event.inputs.labels, 'revert-deploy')) }}
+    needs:
+      - eslint
+      - rspec
+      - cypress
+      - brakeman
+    outputs:
+      tests_passed: ${{ steps.set_passed_output.outputs.passed }}
+    steps:
+      - name: Check FE Lint
+        if: ${{ needs.eslint.result != 'success' && (github.event.inputs.skip_test != 'true' && !contains(github.event.inputs.labels, 'revert-deploy')) }}
+        run: exit 1
+
+      - name: Check rspec status
+        if: ${{ needs.rspec.result != 'success' && (github.event.inputs.skip_test != 'true' && !contains(github.event.inputs.labels, 'revert-deploy')) }}
+        run: exit 1
+
+      - name: Check cypress status
+        if: ${{ needs.cypress.result != 'success' && (github.event.inputs.skip_test != 'true' && !contains(github.event.inputs.labels, 'revert-deploy')) }}
+        run: exit 1
+
+      - name: Check brakeman status
+        if: ${{ needs.brakeman.result != 'success' && (github.event.inputs.skip_test != 'true' && !contains(github.event.inputs.labels, 'revert-deploy')) }}
+        run: exit 1
+
+      - name: Set passed output
+        id: set_passed_output
+        run: echo "passed=true" >> $GITHUB_OUTPUT
+
+      - name: Github context logging
+        if: ${{ github.event.inputs.skip_test != 'true' && !contains(github.event.inputs.labels, 'revert-deploy') }}
+        run: |
+          echo '{
+            "github.workflow": "${{ github.workflow }}",
+            "github.sha": "${{ github.sha }}",
+            "github.run_id": "${{ github.run_id }}",
+            "github.run_attempt": "${{ github.run_attempt }}"
+          }' > prod_workflow_context.json && \
+          gcloud storage cp prod_workflow_context.json gs://apollo-ops_gha_artifacts/
+
+  deploy:
+    needs:
+      - metadata
+      - test-results
+      - build-prod-app-image
+      - build-prod-rails-image
+      - build-prod-sidekiq-image
+    if: |
+      always() &&
+      needs.test-results.outputs.tests_passed &&
+      needs.build-prod-app-image.result == 'success' &&
+      needs.build-prod-rails-image.result == 'success' &&
+      needs.build-prod-sidekiq-image.result == 'success'
+    uses: ./.github/workflows/_deploy.yaml
+    secrets: inherit
+    with:
+      clusterName: prod
+      deployCron: true
+      deploySidekiq: true
+      deploySidekiqMetrics: true
+      deployPrePostJobs: ${{ github.event.inputs.skip_test != 'true' && !contains(github.event.inputs.labels, 'revert-deploy') }}
+      environment: production
+      gitSha: ${{ needs.metadata.outputs.git_sha }}
+      namespace: leadgenie
+      notify: true
+      workloadIdentityProvider: projects/499298628135/locations/global/workloadIdentityPools/prod-gh-pool/providers/gh-action-provider
+      workloadIdentityServiceAccount: prod-k8s-deploy@indigo-lotus-415.iam.gserviceaccount.com
+
+  alert-on-failure:
+    if: failure() && github.ref == 'refs/heads/master'
+    needs:
+      - deploy
+    runs-on:
+      - self-hosted
+      - critical
+      - low-resource
+    steps:
+      - name: Slack Notification
+        uses: rtCamp/action-slack-notify@v2.3.1
+        env:
+          SLACK_CHANNEL: eng-infrastructure-alerts
+          SLACK_COLOR: '#ff0000'
+          SLACK_ICON_EMOJI: ':apollo-logo:'
+          SLACK_MESSAGE: 'This <https://github.com/apolloio/leadgenie/actions/runs/${{ github.run_id }}|production pipeline> failed. @oncall-eng-devops please take a look.'
+          SLACK_TITLE: Prod Pipeline Failed
+          SLACK_USERNAME: Apollo Action Bot
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          MSG_MINIMAL: true
+          SLACK_FOOTER: ''
+          SLACK_LINK_NAMES: true
