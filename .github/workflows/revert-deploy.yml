@@ -32,10 +32,10 @@ concurrency:
 
 jobs:
   lock-master:
-    runs-on:
-      - self-hosted
-      - general
-      - low-resource
+    runs-on: ubuntu-latest
+      #- self-hosted
+      #- general
+      #- low-resource
     steps:
       - name: Lock Master Branch
         env:
@@ -50,10 +50,10 @@ jobs:
             }'
 
   abort-pending-deployment:
-    runs-on:
-      - self-hosted
-      - general
-      - low-resource
+    runs-on: ubuntu-latest
+      #- self-hosted
+      #- general
+      #- low-resource
     steps:
       - name: Abort Pending Production Deployments
         env:
@@ -63,10 +63,10 @@ jobs:
 
   metadata:
     timeout-minutes: 15
-    runs-on:
-      - self-hosted
-      - general
-      - low-resource
+    runs-on: ubuntu-latest
+      #- self-hosted
+      #- general
+      #- low-resource
     outputs:
       git_sha: ${{ steps.sanitized_name.outputs.git_sha }}
       git_branch_name: ${{ steps.sanitized_name.outputs.git_branch_name }}
@@ -173,10 +173,10 @@ jobs:
 
 
   unlock-master:
-    runs-on:
-      - self-hosted
-      - general
-      - low-resource
+    runs-on: ubuntu-latest
+      #- self-hosted
+      #- general
+      #- low-resource
     steps:
       - name: Lock Master Branch
         env:
@@ -189,26 +189,26 @@ jobs:
             -d '{
               "lock_branch": false
             }'
-
-  alert-on-failure:
-    if: failure() && github.ref == 'refs/heads/master'
-    needs:
-      - metadata
-    runs-on:
-      - self-hosted
-      - critical
-      - low-resource
-    steps:
-      - name: Slack Notification
-        uses: rtCamp/action-slack-notify@v2.3.1
-        env:
-          SLACK_CHANNEL: eng-infrastructure-alerts
-          SLACK_COLOR: '#ff0000'
-          SLACK_ICON_EMOJI: ':apollo-logo:'
-          SLACK_MESSAGE: 'This <https://github.com/apolloio/leadgenie/actions/runs/${{ github.run_id }}|production pipeline> failed. @oncall-eng-devops please take a look.'
-          SLACK_TITLE: Prod Pipeline Failed
-          SLACK_USERNAME: Apollo Action Bot
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          MSG_MINIMAL: true
-          SLACK_FOOTER: ''
-          SLACK_LINK_NAMES: true
+#
+  #alert-on-failure:
+    #if: failure() && github.ref == 'refs/heads/master'
+    #needs:
+      #- metadata
+    #runs-on:
+      #- self-hosted
+      #- critical
+      #- low-resource
+    #steps:
+      #- name: Slack Notification
+        #uses: rtCamp/action-slack-notify@v2.3.1
+        #env:
+          #SLACK_CHANNEL: eng-infrastructure-alerts
+          #SLACK_COLOR: '#ff0000'
+          #SLACK_ICON_EMOJI: ':apollo-logo:'
+          #SLACK_MESSAGE: 'This <https://github.com/apolloio/leadgenie/actions/runs/${{ github.run_id }}|production pipeline> failed. @oncall-eng-devops please take a look.'
+          #SLACK_TITLE: Prod Pipeline Failed
+          #SLACK_USERNAME: Apollo Action Bot
+          #SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          #MSG_MINIMAL: true
+          #SLACK_FOOTER: ''
+          #SLACK_LINK_NAMES: true
